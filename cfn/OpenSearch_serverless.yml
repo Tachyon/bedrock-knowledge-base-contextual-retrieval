@@ -1,0 +1,526 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'Contextual embedding demo using Bedrock Knowledge base'
+
+Parameters:
+  IAMUserArn:
+    Description: The Arn of the IAM user (or assumed role) running this CloudFormation template.
+    Type: String
+  AOSSCollectionName:
+    Default: contextual-embed
+    Type: String
+    Description: Name of the Amazon OpenSearch Service Serverless (AOSS) collection.
+    MinLength: 1
+    MaxLength: 21
+    AllowedPattern: ^[a-z0-9](-*[a-z0-9])*
+    ConstraintDescription: Must be lowercase or numbers with a length of 1-63 characters.
+  AOSSIndexName:
+    Default: contextual-embedding-index
+    Type: String
+    Description: Name of the vector index in the Amazon OpenSearch Service Serverless (AOSS) collection.
+
+Resources:
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Description: Creating Amazon S3 bucket to hold source data for knowledge base
+    Properties:
+      BucketName: !Join
+        - '-'
+        - - !Ref AOSSCollectionName
+          - !Sub ${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  cleanupBucketOnDelete:
+    Type: Custom::cleanupbucket
+    Properties:
+      ServiceToken: !GetAtt 'DeleteS3Bucket.Arn'
+      BucketName: !Ref S3Bucket
+    DependsOn: S3Bucket
+
+  AmazonBedrockExecutionRoleForKnowledgeBase:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join
+        - '-'
+        - - AmazonBedrockExecutionRoleForKnowledgeBase
+          - !Ref AOSSCollectionName
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Sub "${AWS::AccountId}"
+              ArnLike:
+                "AWS:SourceArn": !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+      Path: /
+      Policies:
+        - PolicyName: S3RAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:Get*
+                  - s3:List*
+                  - s3:Describe*
+                  - s3-object-lambda:Get*
+                  - s3-object-lambda:List*
+                Resource:
+                  - arn:aws:s3:::aws-blogs-artifacts-public/*
+                  - !Sub arn:aws:s3:::${S3Bucket}
+                  - !Sub arn:aws:s3:::${S3Bucket}/*
+                  - !Sub arn:aws:s3:::${IntermediateStorageBucket}/*
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${IntermediateStorageBucket}/*
+        - PolicyName: AOSSAPIAccessAll
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: !Sub arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*
+        - PolicyName: BedrockListAndInvokeModel
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:ListCustomModels
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/*
+        - PolicyName: LambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:Invoke
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt TransformationLambdaFunction.Arn
+
+  DeleteS3Bucket:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Description: "Delete all objects in S3 bucket"
+      Timeout: 30
+      Role: !GetAtt 'LambdaBasicExecutionRole.Arn'
+      Runtime: python3.9
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref S3Bucket
+      Code:
+        ZipFile: |
+          import json, boto3, logging
+          import cfnresponse
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info("event: {}".format(event))
+              try:
+                  bucket = event['ResourceProperties']['BucketName']
+                  logger.info("bucket: {}, event['RequestType']: {}".format(bucket,event['RequestType']))
+                  if event['RequestType'] == 'Delete':
+                      s3 = boto3.resource('s3')
+                      bucket = s3.Bucket(bucket)
+                      for obj in bucket.objects.filter():
+                          logger.info("delete obj: {}".format(obj))
+                          s3.Object(bucket.name, obj.key).delete()
+
+                  sendResponseCfn(event, context, cfnresponse.SUCCESS)
+              except Exception as e:
+                  logger.info("Exception: {}".format(e))
+                  sendResponseCfn(event, context, cfnresponse.FAILED)
+
+          def sendResponseCfn(event, context, responseStatus):
+              responseData = {}
+              responseData['Data'] = {}
+              cfnresponse.send(event, context, responseStatus, responseData, "CustomResourcePhysicalID")
+  LambdaBasicExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - arn:aws:s3:::aws-blogs-artifacts-public/*
+                  - !Sub arn:aws:s3:::${S3Bucket}/*
+  DataAccessPolicy:
+    Type: 'AWS::OpenSearchServerless::AccessPolicy'
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AOSSCollectionName
+          - access-policy
+      Type: data
+      Description: Access policy for AOSS collection
+      Policy: !Sub >-
+        [{"Description":"Access for cfn user","Rules":[{"ResourceType":"index","Resource":["index/*/*"],"Permission":["aoss:*"]},
+        {"ResourceType":"collection","Resource":["collection/quickstart"],"Permission":["aoss:*"]}],
+        "Principal":["${IAMUserArn}", "${AmazonBedrockExecutionRoleForKnowledgeBase.Arn}"]}]
+  NetworkPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AOSSCollectionName
+          - network-policy
+      Type: network
+      Description: Network policy for AOSS collection
+      Policy: !Sub >-
+        [{"Rules":[{"ResourceType":"collection","Resource":["collection/${AOSSCollectionName}"]}, {"ResourceType":"dashboard","Resource":["collection/${AOSSCollectionName}"]}],"AllowFromPublic":true}]
+  EncryptionPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref AOSSCollectionName
+          - security-policy
+      Type: encryption
+      Description: Encryption policy for AOSS collection
+      Policy: !Sub >-
+        {"Rules":[{"ResourceType":"collection","Resource":["collection/${AOSSCollectionName}"]}],"AWSOwnedKey":true}
+  Collection:
+    Type: 'AWS::OpenSearchServerless::Collection'
+    Properties:
+      Name: !Ref AOSSCollectionName
+      Type: VECTORSEARCH
+      Description: Collection to holds vector search data
+    DependsOn: EncryptionPolicy
+
+  IntermediateStorageBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Join
+        - '-'
+        - - !Ref AOSSCollectionName
+          - "intermediate"
+          - !Sub ${AWS::AccountId}
+  TransformationLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Ref AOSSCollectionName
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt TransformationLambdaFunctionRole.Arn
+      MemorySize: 1024
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import logging
+          import traceback
+          import boto3
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.DEBUG)
+
+          contextual_retrieval_prompt = """
+          <document>
+          {doc_content}
+          </document>
+
+
+          Here is the chunk we want to situate within the whole document
+          <chunk>
+          {chunk_content}
+          </chunk>
+
+
+          Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk.
+          Answer only with the succinct context and nothing else.
+          """
+
+          def lambda_handler(event, context):
+            logger.debug('input={}'.format(json.dumps(event)))
+
+            s3_adapter = S3Adapter()
+            inference_adapter = InferenceAdapter()
+
+            # Extract relevant information from the input event
+            input_files = event.get('inputFiles')
+            input_bucket = event.get('bucketName')
+
+            if not all([input_files, input_bucket]):
+              raise ValueError("Missing required input parameters")
+
+            output_files = []
+            for input_file in input_files:
+
+              processed_batches = []
+              for batch in input_file.get('contentBatches'):
+
+                # Get chunks from S3
+                input_key = batch.get('key')
+
+                if not input_key:
+                  raise ValueError("Missing uri in content batch")
+
+                # Read file from S3
+                file_content = s3_adapter.read_from_s3(bucket_name=input_bucket, file_name=input_key)
+                print(file_content.get('fileContents'))
+
+                # Combine all chunks together to build content of original file
+                # Alternatively we can also read original file and extract text from it
+                original_document_content = ''.join(content.get('contentBody') for content in file_content.get('fileContents') if content)
+
+                # Process one chunk at a time
+                chunked_content = {
+                'fileContents': []
+              }
+                for content in file_content.get('fileContents'):
+                  content_body = content.get('contentBody', '')
+                  content_type = content.get('contentType', '')
+                  content_metadata = content.get('contentMetadata', {})
+
+                  # Update chunk with additional context
+                  prompt = contextual_retrieval_prompt.format(doc_content=original_document_content, chunk_content=content_body)
+                  response_stream = inference_adapter.invoke_model_with_response_stream(prompt)
+                  chunk_context = ''.join(chunk for chunk in response_stream if chunk)
+
+                  # append chunk to output file content
+                  chunked_content['fileContents'].append({
+                  "contentBody": chunk_context + "\n\n" + content_body,
+                  "contentType": content_type,
+                  "contentMetadata": content_metadata,
+                })
+
+                output_key = f"Output/{input_key}"
+
+                # write updated chunk to output S3
+                s3_adapter.write_output_to_s3(input_bucket, output_key, chunked_content)
+
+                # Append the processed chunks file to list of files
+                processed_batches.append({ "key": output_key })
+              output_files.append({
+              "originalFileLocation": input_file.get('originalFileLocation'),
+              "fileMetadata": {},
+              "contentBatches": processed_batches
+            })
+
+            return {
+            "outputFiles": output_files
+          }
+
+          class InferenceAdapter:
+
+              def __init__(self):
+                  self.bedrock_runtime = boto3.client(
+                      service_name='bedrock-runtime',
+                      region_name='us-east-1'
+                  )
+                  self.model_id = 'anthropic.claude-3-haiku-20240307-v1:0'
+
+              def invoke_model_with_response_stream(self, prompt, max_tokens=1000):
+
+                  request_body = json.dumps({
+                          "anthropic_version": "bedrock-2023-05-31",
+                          "max_tokens": max_tokens,
+                          "messages": [
+                              {
+                                  "role": "user",
+                                  "content": prompt
+                              }
+                          ],
+                          "temperature": 0.7,
+                          "top_p": 1
+                      })
+
+                  # Invoke the model
+                  try:
+                      response = self.bedrock_runtime.invoke_model_with_response_stream(
+                          modelId=self.model_id,
+                          contentType='application/json',
+                          accept='application/json',
+                          body=request_body
+                      )
+
+                      for event in response.get('body'):
+                          chunk = json.loads(event['chunk']['bytes'].decode())
+                          if chunk['type'] == 'content_block_delta':
+                              yield chunk['delta']['text']
+                          elif chunk['type'] == 'message_delta':
+                              if 'stop_reason' in chunk['delta']:
+                                  break
+
+                  except ClientError as e:
+                      print(f"An error occurred: {e}")
+                      yield None
+
+          class S3Adapter:
+              def __init__(self):
+                  # Create an S3 client
+                  self.s3_client = boto3.client('s3')
+
+              def write_output_to_s3(self, bucket_name, file_name, json_data):
+                  """
+                  Write a JSON object to an S3 bucket
+
+                  :param bucket_name: Name of the S3 bucket
+                  :param file_name: Name of the file to be created in the bucket
+                  :param json_data: JSON object to be written
+                  :return: True if file was uploaded, else False
+                  """
+
+                  try:
+                      # Convert JSON object to string
+                      json_string = json.dumps(json_data)
+
+                      # Upload the file
+                      response = self.s3_client.put_object(
+                          Bucket=bucket_name,
+                          Key=file_name,
+                          Body=json_string,
+                          ContentType='application/json'
+                      )
+
+                      # Check if the upload was successful
+                      if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                          print(f"Successfully uploaded {file_name} to {bucket_name}")
+                          return True
+                      else:
+                          print(f"Failed to upload {file_name} to {bucket_name}")
+                          return False
+
+                  except ClientError as e:
+                      print(f"Error occurred: {e}")
+                      return False
+
+              def read_from_s3(self, bucket_name, file_name):
+                  """
+                  Write a JSON object to an S3 bucket
+
+                  :param bucket_name: Name of the S3 bucket
+                  :param file_name: Name of the file to be created in the bucket
+                  :return: True if file was uploaded, else False
+                  """
+                  try:
+                      # Get the object from S3
+                      response = self.s3_client.get_object(Bucket=bucket_name, Key=file_name)
+
+                      # Read the content of the file
+                      return json.loads(response['Body'].read().decode('utf-8'))
+
+                  except ClientError as e:
+                      print(f"Error reading file from S3: {str(e)}")
+
+              def parse_s3_path(self, s3_path):
+                  # Remove 's3://' prefix if present
+                  s3_path = s3_path.replace('s3://', '')
+
+                  # Split the path into bucket and key
+                  parts = s3_path.split('/', 1)
+
+                  if len(parts) != 2:
+                      raise ValueError("Invalid S3 path format")
+
+                  bucket_name = parts[0]
+                  file_key = parts[1]
+
+                  return bucket_name, file_key
+  TransformationLambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: AppendToLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+        - PolicyName: BedrockInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:InvokeModel
+                Resource: "arn:aws:bedrock:*::foundation-model/*"
+        - PolicyName: S3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Join
+                - ''
+                - - !GetAtt IntermediateStorageBucket.Arn
+                  - "/*"
+
+Outputs:
+  DataSourceS3Bucket:
+    Value: !GetAtt S3Bucket.Arn
+  DataSourceS3BucketName:
+    Value: !Ref S3Bucket
+  IntermediateS3BucketName:
+    Value: !Ref IntermediateStorageBucket
+  DashboardURL:
+    Value: !GetAtt Collection.DashboardEndpoint
+  TransformationLambdaFunctionArn:
+    Value: !GetAtt TransformationLambdaFunction.Arn
+  AmazonBedrockExecutionRoleForKnowledgeBase:
+    Value: !GetAtt AmazonBedrockExecutionRoleForKnowledgeBase.Arn
+  CollectionARN:
+    Value: !GetAtt Collection.Arn
+  AOSSVectorIndexName:
+    Description: vector index
+    Value: !Ref AOSSIndexName
+  Region:
+    Description: Deployed Region
+    Value: !Ref AWS::Region
