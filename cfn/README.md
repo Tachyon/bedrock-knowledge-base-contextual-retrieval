@@ -100,8 +100,9 @@ Deploy the next stack using the following commands to provision the resources in
 
 **Note** , grab the values of parameters from the output of the previous stack.Use these keys, **AmazonBedrockExecutionRoleForKnowledgeBasearn , AOSSVectorIndexName, CollectionArn, DataSourceS3Bucket, DataSourceS3BucketName, IntermediateS3BucketName, TransformationLambdaFunctionArn** and the corresponding output values from previous stack to pass it as parameters when you are trying to create the 2nd stack 
 
-# Test the RAG App in Amazon Bedrock Agents Console.
-1. Upload test files to DataSourceS3Bucket
-2. Navigate to Bedrock Console and open Bedrock Knowledge base.
-3. Sync the data source
-4. Once sync is complete. Start testing
+# Test the RAG App on AWS Console
+1. Navigate to S3 console and upload your test files into DataSourceS3Bucket
+2. Navigate to Bedrock Console and click on Bedrock Knowledge base.
+3. Click on the knowledge base you just created.
+4. Select the data source and click on Sync button at top right
+5. Once sync is complete. Start testing using the test window on the right
