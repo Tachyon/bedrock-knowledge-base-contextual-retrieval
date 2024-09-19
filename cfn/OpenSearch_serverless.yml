@@ -72,7 +72,6 @@ Resources:
                   - s3-object-lambda:Get*
                   - s3-object-lambda:List*
                 Resource:
-                  - arn:aws:s3:::aws-blogs-artifacts-public/*
                   - !Sub arn:aws:s3:::${S3Bucket}
                   - !Sub arn:aws:s3:::${S3Bucket}/*
                   - !Sub arn:aws:s3:::${IntermediateStorageBucket}/*
@@ -112,7 +111,10 @@ Resources:
               - Effect: Allow
                 Action:
                   - lambda:InvokeFunction
-                Resource: !GetAtt TransformationLambdaFunction.Arn
+                Resource: !Join
+                  - '-'
+                  - - !GetAtt TransformationLambdaFunction.Arn
+                    - ":*"
 
   DeleteS3Bucket:
     Type: AWS::Lambda::Function
