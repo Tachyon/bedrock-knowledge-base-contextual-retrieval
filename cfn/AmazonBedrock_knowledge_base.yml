@@ -1,0 +1,77 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'Serverless RAG Q&A application using Knowledge Base , Agents, Opensearch Serverless'
+
+Parameters:
+  KnowledgeBaseName:
+    Default: contextual-embedding-demo
+    Type: String
+    Description: The name of the knowledge base.
+  KnowledgeBaseDescription:
+    Default: A demo for using contextual embedding with Bedrock KB.
+    Type: String
+    Description: The description of the knowledge base.
+  AmazonBedrockExecutionRoleForKnowledgeBasearn:
+    Type: String
+    Description: Execution Role for Knowledge Base Arn.
+  AOSSIndexName:
+    Default: contextual-embedding-index
+    Type: String
+    Description: Name of the vector index in the Amazon OpenSearch Service Serverless (AOSS) collection.
+  DataSource:
+    Type: String
+    Description: DataSource S3 bucket name. You can get the name from the output section of the previous stack
+  DataSourceBucketArn:
+    Type: String
+    Description: DataSource S3 bucket ARN. You can get the name from the output section of the previous stack
+  IntermediateStorageBucket:
+    Type: String
+    Description: Intermediatee S3 bucket name. You can get the name from the output section of the previous stack
+  CollectionArn:
+    Type: String
+    Description: AOSS Collection ARN. You can get the name from the output section of the previous stack
+  TransformationLambdaFunctionArn:
+    Type: String
+    Description: Transformation Lambda Function ARN. You can get the name from the output section of the previous stack
+
+Resources:
+  KnowledgeBaseWithAoss:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: !Ref KnowledgeBaseName
+      Description: !Ref KnowledgeBaseDescription
+      RoleArn: !Ref AmazonBedrockExecutionRoleForKnowledgeBasearn
+      KnowledgeBaseConfiguration:
+        Type: "VECTOR"
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v1"
+      StorageConfiguration:
+        Type: "OPENSEARCH_SERVERLESS"
+        OpensearchServerlessConfiguration:
+          CollectionArn: !Ref CollectionArn
+          VectorIndexName: !Ref AOSSIndexName
+          FieldMapping:
+            VectorField: "vector"
+            TextField: "text"
+            MetadataField: "metadata"
+  SampleDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref KnowledgeBaseWithAoss
+      Name: !Ref DataSource
+      DataSourceConfiguration:
+        Type: "S3"
+        S3Configuration:
+          BucketArn: !Ref DataSourceBucketArn
+      VectorIngestionConfiguration:
+        CustomTransformationConfiguration:
+          IntermediateStorage:
+            S3Location:
+              URI: !Join
+                - ''
+                - - "s3://"
+                  - !Ref IntermediateStorageBucket
+          Transformations:
+            - StepToApply: "POST_CHUNKING"
+              TransformationFunction:
+                TransformationLambdaConfiguration:
+                  LambdaArn: !Ref TransformationLambdaFunctionArn
